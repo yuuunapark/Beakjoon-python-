@@ -1,0 +1,186 @@
+## mobilenetv2_cifar 0614# 완성버전
+# 0620 업데이트함 -> 최종완성버전
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.model_zoo as model_zoo
+from torch.autograd import Variable
+
+__all__ = ['MobileNetV2', 'call_MobileNetV2']
+
+
+
+
+
+def _make_divisible(v, divisor, min_value=None):
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+def ConvBNReLU(inp, oup, kernel_size=3, stride=1, padding=0, groups=1):
+    return nn.Sequential(
+            nn.Conv2d(inp,
+                      oup,
+                      kernel_size=kernel_size,
+                      stride=stride,
+                      padding=padding,
+                      groups=groups,
+                      bias=False),
+            nn.BatchNorm2d(oup),
+            nn.ReLU6(inplace=True) 
+            )
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, inp, oup, stride, expand_ratio):
+        super(InvertedResidual, self).__init__()
+        self.stride = stride
+        assert stride in [1, 2] 
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        layers = []
+        #if expand_ratio != 1:
+            # pw(확장시키는 1x1 conv 사용)
+
+        layers.append(ConvBNReLU(inp, inp*expand_ratio, 1, 1, 0))
+
+        layers.extend([
+            # dw(depthwise)
+            ConvBNReLU(inp*expand_ratio, inp*expand_ratio, 3, stride=stride, padding=1, groups=inp*expand_ratio),
+            # pw-linear(pointwise)
+            nn.Conv2d(inp*expand_ratio, oup, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(oup)
+        ])
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class MobileNetV2(nn.Module):
+    def __init__(self, dataset, width_mult=1.0, inverted_residual_setting=None, round_nearest=8, cfg = None):
+        super(MobileNetV2, self).__init__()
+        block = InvertedResidual
+        # input_channel = 32 = cfg[0]
+        last_channel = 1280
+        # H = input_channel // (32//2) 
+
+
+        self.width_mult = width_mult
+        if dataset == 'cifar10':
+            num_classes = 10
+        elif dataset == 'cifar100':
+            num_classes = 100
+        self.num_classes = num_classes
+
+
+        if inverted_residual_setting is None:
+            inverted_residual_setting = [
+                # t, s, n 
+                [1, 1 ,1],
+                [6, 1, 2], # change stride 2 -> 1 for CIFAR10
+                [6, 2, 3],
+                [6, 2, 4],
+                [6, 1, 3],
+                [6, 2, 3],
+                [6, 1, 1]
+            ]
+            # n을 다 더하면 17 : 17은 invertedresidual의 개수이다. 
+
+            
+        if cfg is None:
+            cfg = [[32],[32, 32, 16], [96, 96, 24], [144, 144, 24], [144, 144, 32], [192, 192, 32], [192, 192, 32],
+                 [192, 192, 64], [384, 384, 64], [384, 384, 64], [384, 384, 64], [384, 384, 96], [576, 576, 96],
+                 [576, 576, 96], [576, 576, 160], [960, 960, 160], [960, 960, 160], [960, 960 ,320], [1280]]          
+            cfg = [item for sub_list in cfg for item in sub_list]
+
+            
+
+            #cfg = [32,32,32,16,96,96,24,534,534,24,144,144,32,190,190,32,188,188,32,192, 192, 
+            #96,538,538,64,349,349,64,346,346,64, 355, 355, 96, 246, 246, 96, 194, 194, 
+            #96, 534, 534, 160, 161, 161, 160, 141, 141, 160, 780, 780,320]
+            
+
+        input_channel = cfg[0]
+        H = input_channel // (32//2)  # 2
+
+
+        if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 3:
+            raise ValueError("inverted_residual_setting should be non-empty "
+                             "or a 4-element list, got {}".format(inverted_residual_setting))
+
+
+        input_channel = _make_divisible(input_channel * width_mult, round_nearest) 
+        self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)   
+
+
+
+        features = [ConvBNReLU(3, cfg[0], stride=2, padding=1)]
+  
+        i = 1 
+        for (t, s, n) in inverted_residual_setting:
+           
+            for n in range(n):
+                stride = s if n == 0 else 1 
+                output_channel = _make_divisible(cfg[3*i] * width_mult, round_nearest)
+                features.append(block(input_channel, output_channel, stride, expand_ratio=t))
+                input_channel = output_channel
+                i = i+1 
+
+        features.append(ConvBNReLU(input_channel, self.last_channel, kernel_size=1))
+        self.features = nn.Sequential(*features) 
+        
+
+        # nn.AvgPool2d의 첫번째 인자는 kernel_size
+        self.avgpool2d = nn.AvgPool2d(H, ceil_mode=True)
+        self.classifier = nn.Sequential(
+                nn.Linear(self.last_channel, self.num_classes)
+        )
+
+
+        for m in self.modules():
+            
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                # torch.nn.init.kaiming_normal_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu')
+                # weight를 He-initialization으로 초기화 해줌 / std 구하는 방법이 정규분포와 다름 
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                # mean = 0, std = 0.01
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool2d(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x) 
+        return x
+
+def call_MobileNetV2(dataset, **kwargs):
+    model = MobileNetV2(dataset=dataset, **kwargs)
+    return model
+
+if __name__ == '__main__':
+    model = MobileNetV2(dataset='cifar10', width_mult=1.0)
+    print(model)
+
+    # cifar10으로 학습한 모델에 input x를 넣기
+    x = torch.randn(1, 3, 32, 32)
+    y = model(x)
+    print(y.size())
